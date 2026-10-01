@@ -731,7 +731,7 @@ function equipmentCard(){
     <label class="field"><span>Note (optional: max weight, plates, quirks)</span><input type="text" id="eqnote" placeholder="optional" autocomplete="off"></label>
     <div class="row"><button class="btn" data-act="eqAdd">Add</button></div></section>`;
 }
-const APP_VERSION = "guest 1.0 · 1 Oct 2026";
+const APP_VERSION = "guest 1.1 · 1 Oct 2026";
 const DOW = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 /* ============================================================
    GUEST EDITION CORE (profile -> targets, starter plan, program, schedule)
@@ -4155,7 +4155,7 @@ function renderProgress(){
   const healthCard = H ? `<section class="card"><div class="chead"><h2>Blood tests</h2><span class="rx">${esc(parseD(H.date).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"}))}</span></div>
     <div>${H.markers.filter(m=>m.show!==false).map(m=>`<div class="hm"><span>${esc(m.name)} ${m.flag?`<span class="pill ${m.flag==="normal"?"ok":""}" style="${m.flag==="high"||m.flag==="low-normal"?"background:var(--yellow-soft);color:var(--yellow)":""}">${esc(m.flag)}</span>`:""}</span><span class="v">${esc(String(m.value))} ${esc(m.unit||"")}<span class="muted small"> (${esc(m.range||"")})</span></span>${m.note?`<span class="n">${esc(m.note)}</span>`:""}</div>`).join("")}</div>
     ${H.retest?`<p class="small muted" style="margin:0">${esc(H.retest)}</p>`:""}</section>` : "";
-  $app.innerHTML = header("Progress","Bodyweight, food and lifts")+inboxStrip()+bodyCard()+healthCard+nutCard+`
+  $app.innerHTML = header("Progress","Bodyweight, food and lifts")+inboxStrip()+bodyCard()+bloodCard()+nutCard+`
   <section class="card"><div class="chead"><h2>Bodyweight</h2><span class="rx">${fmtN(S.settings.height)} cm · BMI ${bmi}</span></div>
     <div class="stat3"><div class="stat"><div class="l">Now</div><div class="v">${fmtN(cur)}</div></div>
     <div class="stat"><div class="l">Lost</div><div class="v">${lost>0?fmtN(lost):"0"}</div></div>
@@ -4686,10 +4686,170 @@ $app.addEventListener("change",async e=>{
   }
 });
 /* ---------- boot ---------- */
+/* ---------- data schema + migrations ----------
+   GUEST_SCHEMA goes up only when saved data needs reshaping. Add MIGRATIONS[n] (additive, idempotent) and bump it.
+   Everything is forward-only and tolerant: a rolled-back build ignores a newer schema number. */
+const GUEST_SCHEMA=1;
+const MIGRATIONS={ /* 2: ()=>{ ... } */ };
+function runMigrations(){
+  const cur=lsGet("schema")||0; if(cur>=GUEST_SCHEMA) return;
+  try{ const c=localStorage.getItem(LSP+"cache"); if(c) localStorage.setItem(LSP+"cache.pre"+GUEST_SCHEMA, c); }catch(_){}   // safety copy before touching anything
+  for(let v=cur+1; v<=GUEST_SCHEMA; v++){ try{ MIGRATIONS[v]&&MIGRATIONS[v](); }catch(e){ console.error("migration "+v+" failed", e); } }
+  lsSet("schema",GUEST_SCHEMA);
+}
 function friendInit(){
   scrubEx(); try{ navigator.storage&&navigator.storage.persist&&navigator.storage.persist(); }catch(_){}
-  if(!lsGet("onb") && !(S.settings&&S.settings.onboarded)) obStart();
+  if(!lsGet("onb") && !(S.settings&&S.settings.onboarded)){ lsSet("schema",GUEST_SCHEMA); obStart(); } else runMigrations();
 }
+
+/* ============================================================
+   GUEST EDITION: blood results (enter, read from a photo, trends, doctor questions)
+   Data: health/<date> = {date, markers:[{name,value,unit,lo,hi,range,flag}], note, ai}
+   Coach only records, charts and flags against the printed range. It never diagnoses or advises on medication.
+   ============================================================ */
+const BL_LIB=[
+ ["Hormones",[["Testosterone (total)","nmol/L",8.6,29],["Free testosterone","pmol/L",170,600],["SHBG","nmol/L",18,54],["Oestradiol","pmol/L",0,160],["LH","IU/L",1.7,8.6],["FSH","IU/L",1.5,12.4],["Prolactin","mIU/L",86,324]]],
+ ["Blood count and iron",[["Haematocrit","L/L",0.40,0.52],["Haemoglobin","g/L",130,180],["Ferritin","µg/L",30,400],["Iron","µmol/L",10,30],["Transferrin saturation","%",20,50]]],
+ ["Cholesterol",[["Total cholesterol","mmol/L",null,5.5],["LDL","mmol/L",null,3.5],["HDL","mmol/L",1.0,null],["Triglycerides","mmol/L",null,2.0]]],
+ ["Blood sugar",[["Fasting glucose","mmol/L",3.0,5.4],["HbA1c","%",null,5.7]]],
+ ["Liver and kidney",[["ALT","U/L",null,40],["AST","U/L",null,40],["GGT","U/L",null,60],["Creatinine","µmol/L",60,110],["eGFR","mL/min",90,null]]],
+ ["Other",[["TSH","mIU/L",0.4,4.0],["PSA","µg/L",null,4.0],["Vitamin D","nmol/L",50,150],["Vitamin B12","pmol/L",150,700],["CRP","mg/L",null,5]]]
+];
+const BL_FLAT=BL_LIB.flatMap(g=>g[1].map(m=>({name:m[0],unit:m[1],lo:m[2],hi:m[3],group:g[0]})));
+const BL={open:false,date:"",rows:[],note:"",msg:"",busy:false,trend:null,editing:null};
+const blNum=v=>{ const n=parseFloat(String(v).replace(",",".")); return isFinite(n)?n:null; };
+function blRange(lo,hi){ return lo!=null&&hi!=null? `${lo}–${hi}` : lo!=null? `above ${lo}` : hi!=null? `below ${hi}` : ""; }
+function blFlag(v,lo,hi){ if(v==null) return ""; if(lo!=null&&v<lo) return "low"; if(hi!=null&&v>hi) return "high"; return (lo!=null||hi!=null)?"normal":""; }
+function blDates(){ return Object.keys(S.health||{}).filter(d=>(S.health[d].markers||[]).length).sort(); }
+function blSeries(name){ return blDates().map(d=>{ const m=(S.health[d].markers||[]).find(x=>x.name===name); return m&&typeof m.value==="number"?{d,v:m.value,lo:m.lo,hi:m.hi}:null; }).filter(Boolean); }
+function blPill(f){ if(!f) return ""; const st=f==="normal"?"background:var(--green-soft);color:var(--green)":"background:var(--yellow-soft);color:var(--ink)"; return `<span class="pill" style="${st}">${f}</span>`; }
+function blSpark(name){
+  const pts=blSeries(name); if(!pts.length) return "";
+  if(pts.length<2) return `<p class="small muted" style="margin:6px 0 0">Only one result so far. Add another test to see a trend.</p>`;
+  const W=300,H=100,pl=18,pr=18,pt=14,pb=18; const lo=pts[pts.length-1].lo, hi=pts[pts.length-1].hi;
+  let vals=pts.map(p=>p.v); if(lo!=null) vals.push(lo); if(hi!=null) vals.push(hi);
+  let y0=Math.min(...vals), y1=Math.max(...vals); const pad=(y1-y0||1)*0.15; y0-=pad; y1+=pad;
+  const t=pts.map(p=>parseD(p.d).getTime()); let x0=Math.min(...t), x1=Math.max(...t);
+  const X=v=>pl+(v-x0)/(x1-x0||1)*(W-pl-pr), Y=v=>pt+(1-(v-y0)/(y1-y0))*(H-pt-pb);
+  const band=(lo!=null||hi!=null)? `<rect x="${pl}" width="${W-pl-pr}" y="${Y(hi!=null?hi:y1)}" height="${Math.max(2,Y(lo!=null?lo:y0)-Y(hi!=null?hi:y1))}" fill="var(--green-soft)" opacity=".8"/>`:"";
+  const path=pts.map((p,i)=>(i?"L":"M")+X(parseD(p.d).getTime()).toFixed(1)+" "+Y(p.v).toFixed(1)).join(" ");
+  const dots=pts.map(p=>{ const f=blFlag(p.v,p.lo,p.hi); const c=f==="low"||f==="high"?"#C99A06":"var(--blue)"; return `<circle cx="${X(parseD(p.d).getTime()).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="4.5" fill="${c}"/><text x="${X(parseD(p.d).getTime()).toFixed(1)}" y="${(Y(p.v)-8).toFixed(1)}" text-anchor="middle" font-size="10" fill="var(--ink)">${p.v}</text>`; }).join("");
+  const fx=d=>parseD(d).toLocaleDateString(undefined,{month:"short",year:"numeric"});
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(name)} over time" style="width:100%;height:auto;margin-top:6px">${band}<path d="${path}" fill="none" stroke="var(--blue)" stroke-width="2"/>${dots}<text x="${pl}" y="${H-3}" font-size="10" fill="var(--muted)">${fx(pts[0].d)}</text><text x="${W-pr}" y="${H-3}" font-size="10" text-anchor="end" fill="var(--muted)">${fx(pts[pts.length-1].d)}</text></svg>${(lo!=null||hi!=null)?`<div class="small muted">Green band = your lab's range (${esc(blRange(lo,hi))} ${esc(pts.length?(((S.health[pts[pts.length-1].d].markers||[]).find(x=>x.name===name)||{}).unit||""):"")}).</div>`:""}`;
+}
+function bloodCard(){
+  const ds=blDates(); const canPhoto=!!(sample&&sampleImages);
+  const head=`<div class="chead"><h2>Blood results</h2>${ds.length?`<span class="rx">${esc(parseD(ds[ds.length-1]).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"}))}</span>`:""}</div>`;
+  const btns=`<div class="row"><button class="btn" data-act="blAdd">Add results</button>${canPhoto?`<label class="btn ghost" for="blphoto">Read from a photo</label><input type="file" id="blphoto" accept="image/*" hidden>`:""}</div>`;
+  if(!ds.length) return `<section class="card" id="bloodcard">${head}<p class="small muted" style="margin:0">Keep your blood test results in one place. Coach charts each marker over time against the range your lab prints, and flags anything outside it. It never diagnoses; it helps you ask better questions at your next appointment.</p>${btns}${canPhoto?"":`<p class="small muted" style="margin:0">With a Claude key you can also snap a photo of a lab report and have it filled in for you.</p>`}</section>`;
+  const last=S.health[ds[ds.length-1]], prev=ds.length>1?S.health[ds[ds.length-2]]:null;
+  const rows=(last.markers||[]).map(m=>{
+    const p=prev&&(prev.markers||[]).find(x=>x.name===m.name); let tr="";
+    if(p&&typeof p.value==="number"&&typeof m.value==="number"&&p.value!==m.value){ const d=m.value-p.value, pc=p.value?Math.round(d/p.value*100):0; tr=`<span class="small muted"> ${d>0?"↑":"↓"} ${Math.abs(pc)}% since ${esc(parseD(prev.date).toLocaleDateString(undefined,{month:"short",year:"numeric"}))}</span>`; }
+    const open=BL.trend===m.name;
+    return `<div class="hm" style="cursor:pointer" data-act="blTrend" data-n="${esc(m.name)}"><span>${esc(m.name)} ${blPill(m.flag)}</span><span class="v">${esc(String(m.value))} ${esc(m.unit||"")}${m.range?`<span class="muted small"> (${esc(m.range)})</span>`:""}</span><div style="grid-column:1/-1">${tr}${open?blSpark(m.name):""}</div></div>`; }).join("");
+  const ai=last.ai?`<div class="sugg" style="margin-top:10px"><div class="eyebrow">Questions for your doctor</div><div class="why">${esc(last.ai.summary||"")}</div><ul style="margin:6px 0 0;padding-left:18px">${(last.ai.questions||[]).map(q=>`<li class="small">${esc(q)}</li>`).join("")}</ul></div>`:"";
+  const hist=ds.slice().reverse().map(d=>`<div class="hm"><span>${esc(parseD(d).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"}))} <span class="small muted">· ${(S.health[d].markers||[]).length} markers</span></span><span><button class="linkbtn small" data-act="blEdit" data-d="${d}">Edit</button> <button class="linkbtn small" data-act="blDel" data-d="${d}">Delete</button></span></div>`).join("");
+  return `<section class="card" id="bloodcard">${head}<p class="small muted" style="margin:0">Tap a marker to see its trend. Flags compare with the range printed on your lab report.</p>${rows}${last.note?`<p class="small" style="margin:6px 0 0">${esc(last.note)}</p>`:""}${ai}${btns}
+    <div class="row">${sample?`<button class="btn ghost sm" data-act="blAsk" ${BL.busy?"disabled":""}>${BL.busy?"Thinking…":"Questions for my doctor"}</button>`:""}</div>
+    <details><summary class="small">All tests (${ds.length})</summary>${hist}</details>
+    <p class="small muted" style="margin:0">Not medical advice and not a diagnosis. Talk to your doctor about any result that worries you.</p></section>`;
+}
+/* ---------- add / edit sheet ---------- */
+function blOpen(date, rows, note){
+  BL.open=true; BL.date=date||todayStr(); BL.rows=rows||[]; BL.note=note||""; BL.msg=""; BL.editing=date&&S.health[date]?date:null;
+  if(!BL.rows.length){ // suggest the markers most relevant to what they take
+    const meds=(PF().meds||[]).map(m=>((m.k||"")+" "+(m.name||"")).toLowerCase()).join(" ");
+    const sug=/testo/.test(meds)?["Testosterone (total)","Haematocrit","Haemoglobin","SHBG","Oestradiol"]:[];
+    sug.forEach(n=>{ const m=BL_FLAT.find(x=>x.name===n); if(m) BL.rows.push({name:m.name,unit:m.unit,lo:m.lo,hi:m.hi,value:""}); });
+  }
+  blRender();
+}
+function blClose(){ BL.open=false; const el=document.getElementById("bl"); if(el) el.hidden=true; document.body.classList.remove("ob-open"); }
+function blRender(){
+  let el=document.getElementById("bl");
+  if(!el){ document.body.insertAdjacentHTML("beforeend",'<div class="ob" id="bl" role="dialog" aria-modal="true" aria-label="Add blood results"></div>'); el=document.getElementById("bl"); wireBl(el); }
+  const has=n=>BL.rows.some(r=>r.name===n);
+  const groups=BL_LIB.map(([g,list])=>`<div class="eyebrow" style="margin-top:6px">${g}</div><div class="chips">${list.map(m=>`<button class="ch ${has(m[0])?"on":""}" data-bl-pick="${esc(m[0])}">${esc(m[0])}</button>`).join("")}</div>`).join("");
+  const inputs=BL.rows.map((r,i)=>`<div class="ob-card" style="padding:12px"><div style="display:flex;justify-content:space-between;align-items:center"><b>${esc(r.name)}</b><button class="linkbtn small" data-bl-rm="${i}">Remove</button></div>
+    <div class="ofi" style="margin-top:8px"><input type="text" inputmode="decimal" data-bl="${i}|value" value="${esc(r.value??"")}" placeholder="Result" aria-label="${esc(r.name)} result"><input type="text" data-bl="${i}|unit" value="${esc(r.unit||"")}" placeholder="unit" style="max-width:90px" aria-label="Unit"></div>
+    <div class="ofi" style="margin-top:6px"><span class="small muted" style="flex:none">Lab range</span><input type="text" inputmode="decimal" data-bl="${i}|lo" value="${r.lo??""}" placeholder="from" aria-label="Range from"><span class="small muted">to</span><input type="text" inputmode="decimal" data-bl="${i}|hi" value="${r.hi??""}" placeholder="to" aria-label="Range to"></div></div>`).join("");
+  el.innerHTML=`<div class="ob-top"><button class="ob-back" id="blCancel">‹ Close</button><b style="flex:1;text-align:center">${BL.editing?"Edit results":"Add results"}</b><span style="width:56px"></span></div>
+   <div class="ob-body" id="blBody">
+    <label class="of"><span>Date of the test</span><input type="date" id="blDate" value="${esc(BL.date)}" max="${todayStr()}" style="font-size:17px;padding:12px;border-radius:12px"></label>
+    ${inputs?`<p class="small muted">Type each result. The ranges shown are typical adult ranges: replace them with the range printed on <i>your</i> report, since labs differ.</p>${inputs}`:`<p class="small muted">Tap the markers that are on your report below, then type each result.</p>`}
+    <h3 style="margin:8px 0 0;font-size:16px">${inputs?"Add another marker":"Pick your markers"}</h3>
+    ${groups}
+    <div class="ob-card" style="padding:12px"><b>Something else?</b><div class="ofi" style="margin-top:8px"><input type="text" id="blCustom" placeholder="Marker name" autocomplete="off"><button class="btn ghost sm" data-bl-custom="1">Add</button></div></div>
+    <label class="of"><span>Notes (optional)</span><textarea id="blNote" rows="2" placeholder="e.g. fasted, on treatment for 3 months" style="font-size:16px;padding:12px;border-radius:12px">${esc(BL.note)}</textarea></label>
+    <div class="small" style="color:var(--red)">${esc(BL.msg||"")}</div>
+   </div>
+   <div class="ob-foot"><button class="btn" id="blSave">Save</button></div>`;
+  el.hidden=false; document.body.classList.add("ob-open");
+}
+function wireBl(el){
+  el.addEventListener("click",async e=>{
+    const t=e.target.closest("button"); if(!t) return;
+    const keepY=()=>document.getElementById("blBody")?.scrollTop||0; const restore=y=>{ const b=document.getElementById("blBody"); if(b) b.scrollTop=y; };
+    if(t.id==="blCancel"){ blClose(); return; }
+    if(t.dataset.blPick){ const y=keepY(), n=t.dataset.blPick; const i=BL.rows.findIndex(r=>r.name===n); if(i>=0) BL.rows.splice(i,1); else { const m=BL_FLAT.find(x=>x.name===n); BL.rows.push({name:n,unit:m.unit,lo:m.lo,hi:m.hi,value:""}); } blRender(); restore(y); return; }
+    if(t.dataset.blRm!==undefined){ const y=keepY(); BL.rows.splice(Number(t.dataset.blRm),1); blRender(); restore(y); return; }
+    if(t.dataset.blCustom){ const n=(document.getElementById("blCustom").value||"").trim(); if(!n) return; if(!BL.rows.some(r=>r.name.toLowerCase()===n.toLowerCase())) BL.rows.push({name:n,unit:"",lo:null,hi:null,value:""}); const y=keepY(); blRender(); restore(y); return; }
+    if(t.id==="blSave"){
+      const rows=BL.rows.map(r=>({name:r.name,unit:String(r.unit||"").trim(),value:blNum(r.value),lo:blNum(r.lo),hi:blNum(r.hi)})).filter(r=>r.value!=null);
+      if(!rows.length){ BL.msg="Type at least one result."; blRender(); return; }
+      const date=document.getElementById("blDate").value||todayStr(); BL.note=document.getElementById("blNote").value;
+      const markers=rows.map(r=>({name:r.name,value:r.value,unit:r.unit,lo:r.lo,hi:r.hi,range:blRange(r.lo,r.hi),flag:blFlag(r.value,r.lo,r.hi)}));
+      const doc={date,markers,note:BL.note.trim().slice(0,400)};
+      if(BL.editing&&BL.editing!==date){ try{ if(db) await db.doc("health/"+BL.editing).delete(); }catch(_){} delete S.health[BL.editing]; }
+      S.health[date]=doc; try{ if(db) await db.doc("health/"+date).set(doc); }catch(_){}
+      cacheAll(); blClose(); S.tab="progress"; render(); toast("Saved"); return;
+    }
+  });
+  el.addEventListener("input",e=>{
+    const t=e.target; if(t.dataset.bl){ const [i,f]=t.dataset.bl.split("|"); BL.rows[Number(i)][f]=t.value; }
+    if(t.id==="blNote") BL.note=t.value; if(t.id==="blDate") BL.date=t.value;
+  });
+}
+/* ---------- read a lab report from a photo ---------- */
+async function blFromPhoto(file){
+  toast("Reading your report…");
+  try{
+    const out=await sample.json(`This photo is a blood test report. Extract every result that is visible: "name" (as printed, short), "value" (a number), "unit", and the printed reference range as numbers "lo" and "hi" (null when there is no lower or upper limit), plus the test date as "date" (YYYY-MM-DD, or null if not printed). Include only results you can actually read. Do not interpret them.
+Reply with only JSON like {"date":"2026-09-12","markers":[{"name":"Testosterone","value":14.2,"unit":"nmol/L","lo":8.6,"hi":29}]}.`,{images:[file],task:"label",max_tokens:3000});
+    const mk=(out&&out.markers||[]).filter(m=>m&&m.name&&typeof m.value==="number");
+    if(!mk.length){ toast("Couldn't read any results. Try a clearer, flatter photo."); return; }
+    const rows=mk.map(m=>{ const lib=BL_FLAT.find(x=>x.name.toLowerCase()===String(m.name).toLowerCase()||x.name.toLowerCase().startsWith(String(m.name).toLowerCase())); return {name:lib?lib.name:String(m.name).slice(0,40),unit:m.unit||(lib&&lib.unit)||"",lo:typeof m.lo==="number"?m.lo:(lib?null:null),hi:typeof m.hi==="number"?m.hi:null,value:m.value}; });
+    const d=/^\d{4}-\d{2}-\d{2}$/.test(out.date||"")&&out.date<=todayStr()?out.date:todayStr();
+    blOpen(d,rows,""); BL.editing=null; BL.msg="Check each number against your report before saving."; blRender();
+  }catch(e){ toast(e.code==="bad_key"?"API key rejected.":e.code==="no_credit"?"Anthropic account is out of credit.":"Couldn't read that. Try again."); }
+}
+/* ---------- plain-language summary + questions for the doctor ---------- */
+async function blAsk(){
+  if(!sample){ toast("Add your Claude key first."); return; }
+  const ds=blDates(); if(!ds.length) return; BL.busy=true; render();
+  try{
+    const hist=ds.slice(-4).map(d=>`${d}: `+(S.health[d].markers||[]).map(m=>`${m.name} ${m.value}${m.unit?" "+m.unit:""}${m.range?" (range "+m.range+")":""}${m.flag&&m.flag!=="normal"?" ["+m.flag+"]":""}`).join("; ")).join("\n");
+    const out=await sample.json(`You help someone understand their blood results before they see their doctor. You are not a doctor and must not diagnose.
+${athleteLine()} ${medsTxt()}
+RESULTS (oldest to newest):
+${hist}
+Write: "summary" = 2-3 plain sentences on what changed since the previous test and which values sit outside the lab range; "questions" = up to 5 specific questions worth asking their doctor. Never diagnose, never say to start, stop or change any medication or dose, never suggest supplements. If a value is far outside its range, say it is worth contacting the doctor soon.
+Reply with only JSON {"summary":"...","questions":["..."]}`,{task:"coach",max_tokens:900});
+    const last=ds[ds.length-1]; const doc={...S.health[last],ai:{at:Date.now(),summary:String(out.summary||"").slice(0,600),questions:(out.questions||[]).slice(0,5).map(q=>String(q).slice(0,200))}};
+    S.health[last]=doc; try{ if(db) await db.doc("health/"+last).set(doc); }catch(_){} cacheAll();
+  }catch(e){ toast(e.code==="bad_key"?"API key rejected.":e.code==="no_credit"?"Anthropic account is out of credit.":"Couldn't do that right now."); }
+  BL.busy=false; render();
+}
+$app.addEventListener("click",async e=>{
+  const b=e.target.closest("[data-act]"); if(!b||!/^bl/.test(b.dataset.act)) return; const a=b.dataset.act;
+  if(a==="blAdd") blOpen();
+  else if(a==="blEdit"){ const d=b.dataset.d, h=S.health[d]; blOpen(d,(h.markers||[]).map(m=>({name:m.name,unit:m.unit||"",lo:m.lo??null,hi:m.hi??null,value:m.value})),h.note||""); }
+  else if(a==="blDel"){ const d=b.dataset.d; if(!confirm("Delete this test result?")) return; delete S.health[d]; try{ if(db) await db.doc("health/"+d).delete(); }catch(_){} cacheAll(); render(); }
+  else if(a==="blTrend"){ BL.trend=BL.trend===b.dataset.n?null:b.dataset.n; render(); }
+  else if(a==="blAsk") blAsk();
+});
+$app.addEventListener("change",e=>{ const t=e.target; if(t.id==="blphoto"&&t.files&&t.files[0]){ const f=t.files[0]; t.value=""; blFromPhoto(f); } });
 
 friendInit(); rebuildProgram();
 if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
